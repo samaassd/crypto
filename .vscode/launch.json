@@ -1,0 +1,16 @@
+
+{
+    "name": "Run Backtesting",
+    "type": "python",
+    "request": "launch",
+    "program": "${workspaceFolder}/tests/backtest.py",
+    "console": "integratedTerminal",
+    "envFile": "${workspaceFolder}/.env",
+    "cwd": "${workspaceFolder}",
+    "python": "${workspaceFolder}/venv/bin/python",
+    "justMyCode": true,
+    "configurations": [
+        
+    
+    ]
+}
