@@ -10,3 +10,4 @@ class PriceAggregator:
             for connector in self.connectors:
                 prices[pair][connector.name] = connector.get_price(token_in, token_out)
         return prices
+    
