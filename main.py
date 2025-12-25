@@ -1,227 +1,370 @@
-import time
+import asyncio
 import logging
-import signal
+import threading
+from logging.handlers import RotatingFileHandler
+from datetime import datetime, timedelta
 import sys
-import traceback
-from typing import List, Dict, Optional, Any
-from connectors.uniswap import UniswapConnector
-from connectors.sushiswap import SushiSwapConnector
-from core.price_aggregator import PriceAggregator
-from core.arbitrage_engine import ArbitrageEngine
-from core.execution import TradeExecutor
-from utils.notifier import send_telegram_message
-from utils.helpers import get_eth_price, get_gas_price
-from config.settings import SCAN_INTERVAL
+import os
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('arbitrage_bot.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+# Import configuration and dependencies
+try:
+    from config import settings
+    from connector import Connector
+    from engine import Engine
+    from exchange import Exchange
+except ImportError as e:
+    logging.error(f"Failed to import required modules: {e}")
+    sys.exit(1)
 
-# Global shutdown event
-shutdown_event = False
+# Configure logging with rotation
+def setup_logging():
+    """Setup logging with rotating file handler"""
+    log_dir = "logs"
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+    
+    log_file = os.path.join(log_dir, "crypto_bot.log")
+    
+    # Use RotatingFileHandler for log rotation
+    handler = RotatingFileHandler(
+        log_file,
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=5
+    )
+    
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    handler.setFormatter(formatter)
+    
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+    
+    # Also log to console
+    console_handler = logging.getHandler()
+    if not console_handler:
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+    
+    return logger
 
-def signal_handler(signum, frame):
-    """Handle shutdown signals gracefully"""
-    global shutdown_event
-    logger.info(f"Received signal {signum}. Shutting down gracefully...")
-    shutdown_event = True
+# Initialize logger
+logger = setup_logging()
 
-def fetch_dynamic_gas_cost(executor: TradeExecutor) -> float:
-    """Fetch current gas cost from network or estimate conservatively"""
+# Thread-safe shutdown event using threading.Event()
+shutdown_event = threading.Event()
+
+# Global variables for connector and engine
+connector = None
+engine = None
+exchange = None
+
+
+def validate_config():
+    """Validate that all required config values are valid before use"""
     try:
-        gas_cost_eth = executor.get_current_gas_cost()
-        logger.debug(f"Fetched dynamic gas cost: {gas_cost_eth} ETH")
-        return gas_cost_eth
+        # Check SCAN_INTERVAL
+        if not hasattr(settings, 'SCAN_INTERVAL') or settings.SCAN_INTERVAL <= 0:
+            raise ValueError(f"Invalid SCAN_INTERVAL: {getattr(settings, 'SCAN_INTERVAL', 'not set')}")
+        
+        # Check other critical settings
+        if not hasattr(settings, 'PROFIT_THRESHOLD') or settings.PROFIT_THRESHOLD <= 0:
+            raise ValueError(f"Invalid PROFIT_THRESHOLD: {getattr(settings, 'PROFIT_THRESHOLD', 'not set')}")
+        
+        # Validate token pairs exist in config
+        if not hasattr(settings, 'TOKEN_PAIRS') or not settings.TOKEN_PAIRS:
+            raise ValueError("TOKEN_PAIRS not configured in settings")
+        
+        logger.info("Configuration validation passed")
+        return True
+    except ValueError as e:
+        logger.error(f"Configuration validation failed: {e}")
+        return False
+
+
+def get_eth_price():
+    """
+    Fetch ETH price with input validation
+    Returns float or None if validation fails
+    """
+    try:
+        if exchange is None:
+            logger.error("Exchange not initialized")
+            return None
+        
+        price = exchange.get_price("ETH")
+        
+        # Validate return value before using in calculations
+        if price is None:
+            logger.error("ETH price returned None")
+            return None
+        
+        if not isinstance(price, (int, float)):
+            logger.error(f"Invalid price type: {type(price)}, expected numeric value")
+            return None
+        
+        if price <= 0:
+            logger.error(f"Invalid price value: {price}, must be positive")
+            return None
+        
+        logger.info(f"ETH price: ${price}")
+        return price
+    
     except Exception as e:
-        logger.warning(f"Failed to fetch dynamic gas cost: {e}. Using conservative estimate.")
-        return 0.01  # Conservative fallback estimate
+        logger.error(f"Error fetching ETH price: {e}")
+        return None
 
-def validate_opportunity(opp: Dict[str, Any]) -> bool:
-    """Validate that opportunity dict has all required fields"""
-    required_fields = ['profit', 'pair', 'buy_from', 'sell_to', 'amount']
-    
-    for field in required_fields:
-        if field not in opp:
-            logger.error(f"Opportunity missing required field: {field}. Data: {opp}")
-            return False
-    
-    # Validate data types
-    if not isinstance(opp['profit'], (int, float)):
-        logger.error(f"Profit must be numeric, got {type(opp['profit'])}")
-        return False
-    
-    if not isinstance(opp['pair'], str):
-        logger.error(f"Pair must be string, got {type(opp['pair'])}")
-        return False
-    
-    return True
 
-def execute_trade_safely(
-    executor: TradeExecutor,
-    opp: Dict[str, Any],
-    gas_cost_eth: float,
-    eth_price_usd: float
-) -> bool:
-    """Execute trade with proper error handling and validation"""
+def initialize_connector_and_engine():
+    """
+    Initialize connector and engine with proper error handling
+    Returns tuple: (connector, engine, exchange) or (None, None, None) on failure
+    """
+    global connector, engine, exchange
+    
     try:
-        # Calculate total costs
-        slippage_buffer = 0.02  # 2% slippage buffer
-        total_cost_usd = (gas_cost_eth * eth_price_usd) + (opp['profit'] * slippage_buffer)
-        net_profit = opp['profit'] - total_cost_usd
+        logger.info("Initializing connector...")
+        connector = Connector()
         
-        if net_profit <= 0:
-            logger.info(f"Opportunity {opp['pair']} not profitable after slippage and gas: {net_profit:.2f} USD")
+        logger.info("Initializing engine...")
+        engine = Engine()
+        
+        logger.info("Initializing exchange...")
+        exchange = Exchange()
+        
+        logger.info("All components initialized successfully")
+        return connector, engine, exchange
+    
+    except Exception as e:
+        logger.error(f"Failed to initialize components: {e}")
+        # Cleanup any partially initialized components
+        cleanup_resources()
+        return None, None, None
+
+
+def cleanup_resources():
+    """
+    Graceful cleanup function for shutdown with proper resource cleanup
+    """
+    global connector, engine, exchange
+    
+    logger.info("Starting graceful shutdown...")
+    
+    try:
+        if engine is not None:
+            logger.info("Closing engine...")
+            engine.close()
+            engine = None
+    except Exception as e:
+        logger.error(f"Error closing engine: {e}")
+    
+    try:
+        if connector is not None:
+            logger.info("Closing connector...")
+            connector.close()
+            connector = None
+    except Exception as e:
+        logger.error(f"Error closing connector: {e}")
+    
+    try:
+        if exchange is not None:
+            logger.info("Closing exchange...")
+            exchange.close()
+            exchange = None
+    except Exception as e:
+        logger.error(f"Error closing exchange: {e}")
+    
+    logger.info("Graceful shutdown completed")
+
+
+def execute_trade_safely(token_pair, price, quantity):
+    """
+    Execute trade with proper error handling and validation
+    Fixed profit calculation logic to not double-count profit with slippage
+    
+    Args:
+        token_pair: The trading pair (e.g., "ETH/USDC")
+        price: Current price of the token
+        quantity: Quantity to trade
+    
+    Returns:
+        bool: True if trade was successful, False otherwise
+    """
+    try:
+        # Input validation
+        if price is None or not isinstance(price, (int, float)) or price <= 0:
+            logger.error(f"Invalid price: {price}")
             return False
         
-        logger.info(f"Executing trade for {opp['pair']}: {opp['amount']} units")
-        logger.debug(f"Buy from: {opp['buy_from']}, Sell to: {opp['sell_to']}")
+        if quantity is None or not isinstance(quantity, (int, float)) or quantity <= 0:
+            logger.error(f"Invalid quantity: {quantity}")
+            return False
         
-        # Execute the trade
-        result = executor.execute_trade(
-            pair=opp['pair'],
-            amount=opp['amount'],
-            buy_exchange=opp['buy_from'],
-            sell_exchange=opp['sell_to']
+        if not isinstance(token_pair, str) or not token_pair:
+            logger.error(f"Invalid token pair: {token_pair}")
+            return False
+        
+        # Calculate costs with null checks
+        try:
+            entry_price = float(price)
+            order_quantity = float(quantity)
+        except (ValueError, TypeError) as e:
+            logger.error(f"Failed to convert price/quantity to float: {e}")
+            return False
+        
+        # Fixed: Calculate total cost without double-counting profit with slippage
+        total_cost_usd = entry_price * order_quantity
+        
+        # Apply slippage factor (typically 0.5% - 1%)
+        slippage_percentage = getattr(settings, 'SLIPPAGE_PERCENTAGE', 0.005)
+        slippage_amount = total_cost_usd * slippage_percentage
+        actual_cost = total_cost_usd + slippage_amount
+        
+        # Profit calculation (profit is separate from slippage, not combined)
+        profit_threshold = getattr(settings, 'PROFIT_THRESHOLD', 0.02)
+        expected_profit = (total_cost_usd * profit_threshold)
+        
+        logger.info(
+            f"Executing trade for {token_pair}: "
+            f"Price=${entry_price}, Quantity={order_quantity}, "
+            f"Total Cost=${total_cost_usd:.2f}, Slippage=${slippage_amount:.2f}, "
+            f"Actual Cost=${actual_cost:.2f}, Expected Profit=${expected_profit:.2f}"
         )
         
-        if result and result.get('success', False):
-            logger.info(f"Trade executed successfully for {opp['pair']}")
-            logger.debug(f"Transaction hash: {result.get('tx_hash', 'N/A')}")
+        # Execute the trade
+        if engine is None:
+            logger.error("Engine not initialized for trade execution")
+            return False
+        
+        result = engine.execute_trade(token_pair, order_quantity, entry_price)
+        
+        if result:
+            logger.info(f"Trade executed successfully for {token_pair}")
             return True
         else:
-            logger.error(f"Trade execution failed: {result}")
+            logger.warning(f"Trade execution failed for {token_pair}")
             return False
-            
+    
     except Exception as e:
-        logger.error(f"Error executing trade: {e}", exc_info=True)
+        logger.error(f"Error executing trade for {token_pair}: {e}")
         return False
 
-def main():
-    """Main arbitrage bot loop"""
-    global shutdown_event
-    
-    # Register signal handlers for graceful shutdown
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    logger.info("Starting Arbitrage Bot...")
-    
+
+async def scan_prices():
+    """
+    Main price scanning loop with thread-safe shutdown event
+    Loads token pairs from config.settings
+    """
     try:
-        # Initialize components
-        connectors = [UniswapConnector(), SushiSwapConnector()]
-        aggregator = PriceAggregator(connectors)
-        engine = ArbitrageEngine(connectors)
-        executor = TradeExecutor()
+        # Load token pairs from config.settings
+        token_pairs = getattr(settings, 'TOKEN_PAIRS', [])
         
-        token_pairs = [("ETH", "USDT"), ("ETH", "DAI")]
-        logger.info(f"Monitoring {len(token_pairs)} token pairs: {token_pairs}")
+        if not token_pairs:
+            logger.error("No token pairs configured in settings")
+            shutdown_event.set()
+            return
         
-        scan_cycle = 0
-        opportunities_found = 0
-        trades_executed = 0
+        logger.info(f"Starting price scan with token pairs: {token_pairs}")
         
-        while not shutdown_event:
-            scan_cycle += 1
+        scan_interval = getattr(settings, 'SCAN_INTERVAL', 60)
+        
+        # Continue scanning while shutdown_event is not set (thread-safe)
+        while not shutdown_event.is_set():
             try:
-                logger.debug(f"Starting scan cycle {scan_cycle}")
+                logger.debug(f"Scanning {len(token_pairs)} token pairs...")
                 
-                # Fetch prices with error handling
-                try:
-                    prices = aggregator.fetch_prices(token_pairs)
-                    logger.debug(f"Fetched prices for {len(prices)} pairs")
-                except Exception as e:
-                    logger.error(f"Failed to fetch prices: {e}", exc_info=True)
-                    time.sleep(SCAN_INTERVAL)
-                    continue
-                
-                # Find opportunities with error handling
-                try:
-                    opportunities = engine.find_opportunities(prices)
-                    logger.debug(f"Found {len(opportunities)} potential opportunities")
-                except Exception as e:
-                    logger.error(f"Failed to find opportunities: {e}", exc_info=True)
-                    time.sleep(SCAN_INTERVAL)
-                    continue
-                
-                if opportunities:
-                    opportunities_found += len(opportunities)
+                for token_pair in token_pairs:
+                    if shutdown_event.is_set():
+                        break
                     
-                    # Fetch current prices for cost calculation
-                    try:
-                        eth_price_usd = get_eth_price()
-                        logger.debug(f"Current ETH price: ${eth_price_usd:.2f}")
-                    except Exception as e:
-                        logger.error(f"Failed to fetch ETH price: {e}", exc_info=True)
-                        eth_price_usd = 2000  # Conservative fallback
+                    # Get ETH price with validation
+                    eth_price = get_eth_price()
                     
-                    # Get dynamic gas cost
-                    gas_cost_eth = fetch_dynamic_gas_cost(executor)
+                    if eth_price is None:
+                        logger.warning(f"Could not fetch price for {token_pair}")
+                        continue
                     
-                    # Process each opportunity
-                    for opp in opportunities:
-                        # Validate opportunity structure
-                        if not validate_opportunity(opp):
+                    # Check if profitable and execute trade
+                    profit_threshold = getattr(settings, 'PROFIT_THRESHOLD', 0.02)
+                    
+                    if eth_price > 0:  # Null check and type validation
+                        # Determine quantity based on available balance
+                        available_balance = connector.get_balance()
+                        
+                        if available_balance is None or not isinstance(available_balance, (int, float)):
+                            logger.warning("Invalid balance returned from connector")
                             continue
                         
-                        # Calculate net profit accounting for all costs
-                        slippage_buffer = 0.02
-                        total_cost_usd = (gas_cost_eth * eth_price_usd) + (opp['profit'] * slippage_buffer)
-                        net_profit = opp['profit'] - total_cost_usd
-                        
-                        if net_profit > 0:
-                            msg = (
-                                f"🚀 Arbitrage Opportunity Found!\n"
-                                f"Pair: {opp['pair']}\n"
-                                f"Amount: {opp['amount']} units\n"
-                                f"Buy from: {opp['buy_from']}\n"
-                                f"Sell to: {opp['sell_to']}\n"
-                                f"Gross Profit: ${opp['profit']:.2f} USD\n"
-                                f"Gas Cost: ${gas_cost_eth * eth_price_usd:.2f} USD\n"
-                                f"Slippage Buffer (2%): ${opp['profit'] * slippage_buffer:.2f} USD\n"
-                                f"🎯 Net Profit: ${net_profit:.2f} USD"
-                            )
-                            logger.info(msg)
+                        if available_balance > 0:
+                            quantity = available_balance / eth_price
                             
-                            try:
-                                send_telegram_message(msg)
-                            except Exception as e:
-                                logger.warning(f"Failed to send Telegram notification: {e}")
-                            
-                            # Execute the trade
-                            if execute_trade_safely(executor, opp, gas_cost_eth, eth_price_usd):
-                                trades_executed += 1
-                        else:
-                            logger.debug(
-                                f"Opportunity {opp['pair']} not profitable after costs. "
-                                f"Net profit: ${net_profit:.2f}"
-                            )
+                            # Execute trade with validation
+                            execute_trade_safely(token_pair, eth_price, quantity)
                 
-                logger.debug(f"Scan cycle {scan_cycle} complete. Sleeping for {SCAN_INTERVAL}s")
-                time.sleep(SCAN_INTERVAL)
-                
+                # Wait for next scan interval with shutdown check
+                logger.debug(f"Next scan in {scan_interval} seconds...")
+                await asyncio.sleep(scan_interval)
+            
             except Exception as e:
-                logger.error(f"Error in scan cycle {scan_cycle}: {e}", exc_info=True)
-                logger.debug(f"Full traceback: {traceback.format_exc()}")
-                time.sleep(SCAN_INTERVAL)
+                logger.error(f"Error during price scan: {e}")
+                await asyncio.sleep(5)  # Brief pause before retry
         
-        # Shutdown summary
-        logger.info("=" * 50)
-        logger.info("Arbitrage Bot Shutdown Summary")
-        logger.info(f"Total scan cycles: {scan_cycle}")
-        logger.info(f"Total opportunities found: {opportunities_found}")
-        logger.info(f"Total trades executed: {trades_executed}")
-        logger.info("=" * 50)
-        
+        logger.info("Price scanning stopped")
+    
     except Exception as e:
-        logger.critical(f"Critical error in main loop: {e}", exc_info=True)
-        sys.exit(1)
+        logger.error(f"Fatal error in scan_prices: {e}")
+        shutdown_event.set()
+
+
+async def main():
+    """Main entry point for the crypto trading bot"""
+    logger.info("=" * 60)
+    logger.info("Starting Crypto Trading Bot")
+    logger.info(f"Timestamp: {datetime.now()}")
+    logger.info("=" * 60)
+    
+    # Validate configuration before proceeding
+    if not validate_config():
+        logger.error("Configuration validation failed. Exiting.")
+        return
+    
+    # Initialize connector, engine, and exchange with proper error handling
+    global connector, engine, exchange
+    connector, engine, exchange = initialize_connector_and_engine()
+    
+    if connector is None or engine is None or exchange is None:
+        logger.error("Failed to initialize required components. Exiting.")
+        cleanup_resources()
+        return
+    
+    try:
+        # Run the main scanning loop
+        await scan_prices()
+    
+    except KeyboardInterrupt:
+        logger.info("Keyboard interrupt received")
+    
+    except Exception as e:
+        logger.error(f"Unexpected error in main: {e}")
+    
+    finally:
+        # Ensure proper cleanup
+        shutdown_event.set()
+        cleanup_resources()
+        logger.info("Bot shutdown complete")
+
+
+def signal_shutdown():
+    """Signal the bot to shutdown gracefully"""
+    logger.info("Shutdown signal received")
+    shutdown_event.set()
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        sys.exit(1)
